@@ -1,3 +1,4 @@
+using System.ComponentModel.DataAnnotations;
 using System.Reflection;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -13,10 +14,33 @@ public static class ServiceCollectionExtensions
     /// </summary>
     public static IServiceCollection AddRabbitMQ(this IServiceCollection services, Action<RabbitMQOptions> configure)
     {
+        var options = new RabbitMQOptions();
+        configure(options);
+        Validator.ValidateObject(options, new ValidationContext(options), validateAllProperties: true);
+
         services.Configure(configure);
         services.AddSingleton<RabbitMQConnectionManager>();
         services.AddSingleton<IRabbitMQPublisher, RabbitMQPublisher>();
         services.AddHostedService<RabbitMQConsumerHostedService>();
+        return services;
+    }
+
+    /// <summary>
+    /// 注册 RabbitMQ 健康检查，可通过 ASP.NET Core 的 /health 端点检测 RabbitMQ 连接状态
+    /// </summary>
+    /// <param name="services">服务集合</param>
+    /// <param name="name">健康检查名称，默认 "rabbitmq"</param>
+    /// <param name="tags">健康检查标签</param>
+    public static IServiceCollection AddRabbitMQHealthCheck(
+        this IServiceCollection services, string name = "rabbitmq", params string[] tags)
+    {
+        services.AddHealthChecks()
+            .Add(new Microsoft.Extensions.Diagnostics.HealthChecks.HealthCheckRegistration(
+                name,
+                sp => sp.GetRequiredService<RabbitMQHealthCheck>(),
+                failureStatus: Microsoft.Extensions.Diagnostics.HealthChecks.HealthStatus.Unhealthy,
+                tags));
+        services.AddSingleton<RabbitMQHealthCheck>();
         return services;
     }
 

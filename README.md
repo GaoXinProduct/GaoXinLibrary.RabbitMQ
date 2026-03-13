@@ -19,6 +19,11 @@ dotnet add package GaoXinLibrary.RabbitMQ
 - **队列最大长度** — `x-max-length` 防止消息堆积
 - **Publisher Confirms** — 发布者确认模式，保障消息可靠投递
 - **DI 注入** — `AddRabbitMQ()` + `AddRabbitMQHandlers()` 自动扫描注册
+- **批量发布** — `PublishBatchAsync` 批量投递消息，高吞吐场景性能更优
+- **连接自动重连** — 连接断开后指数退避自动重连，支持配置最大重试次数
+- **消费者 Channel 自动恢复** — 后台定期检测 Channel 状态，断开后自动重建消费者
+- **健康检查** — 集成 ASP.NET Core `IHealthCheck`，支持 `/health` 端点探活
+- **配置验证** — 注册时即刻校验必填项，Fail-Fast 避免运行时才报错
 
 ## 快速开始
 
@@ -81,6 +86,11 @@ public class OrderService
         await _publisher.PublishAsync("order.exchange", "order.vip",
             new OrderCreatedEvent { OrderId = "456", Amount = 999m },
             priority: 9);
+
+        // 批量发布（高吞吐场景推荐）
+        var orders = Enumerable.Range(1, 100).Select(i =>
+            new OrderCreatedEvent { OrderId = $"batch_{i}", Amount = i * 10m });
+        await _publisher.PublishBatchAsync("order.exchange", "order.created", orders);
     }
 }
 ```
@@ -200,7 +210,7 @@ builder.Services.AddRabbitMQ(options =>
 ```csharp
 [RabbitMQSubscribe("order.exchange", "order.*", RabbitMQExchangeType.Topic,
     MaxRetries = 5, MaxDelayRetries = 2, RetryDelaySeconds = 30,
-    MaxPriority = 10, MaxLength = 10000, EnableDeadLetter = 1)]
+    MaxPriority = 10, MaxLength = 10000, EnableDeadLetter = TriState.Enabled)]
 public class OrderHandler : IMessageHandler<OrderEvent> { ... }
 ```
 
@@ -229,7 +239,7 @@ await publisher.PublishAsync("order.exchange", "order.vip",
 ```
 
 - 全局配置：`options.EnableDeadLetter = true`（默认启用）
-- 单个 Handler 覆盖：`EnableDeadLetter = 1`（启用）或 `0`（禁用），`-1`（使用全局）
+- 单个 Handler 覆盖：`EnableDeadLetter = TriState.Enabled`（启用）或 `TriState.Disabled`（禁用），`TriState.Default`（使用全局配置）
 
 ## 消费者预取数（PrefetchCount）
 
@@ -346,6 +356,13 @@ catch (Exception ex)
 | RetryDelaySeconds | 10 | 延迟重试间隔秒数 |
 | EnableDeadLetter | true | 是否启用死信队列 |
 | EnablePublisherConfirms | false | 是否启用发布者确认模式 |
+| AutoMigrateQueues | true | 队列参数不匹配时是否自动删除并重建队列（生产环境建议关闭） |
+| ShutdownTimeoutSeconds | 30 | 优雅关闭超时秒数（等待正在处理的消息完成） |
+| AutomaticRecoveryEnabled | true | 是否启用 RabbitMQ.Client 内置的自动恢复 |
+| NetworkRecoveryInterval | 5s | 自动恢复间隔 |
+| ReconnectMaxRetries | 10 | 连接断开后重连最大重试次数（0=不限次数） |
+| ReconnectInitialDelay | 1s | 重连初始延迟（指数退避） |
+| ReconnectMaxDelay | 30s | 重连最大延迟 |
 
 ### RabbitMQSubscribeAttribute 参数
 
@@ -359,7 +376,7 @@ catch (Exception ex)
 | AutoDelete | false | 是否自动删除 |
 | MaxPriority | 0 | 队列最大优先级（0=不启用，建议 1-10） |
 | MaxLength | 0 | 队列最大长度（0=不限制） |
-| EnableDeadLetter | -1 | 是否启用死信队列（-1=全局，0=禁用，1=启用） |
+| EnableDeadLetter | TriState.Default | 是否启用死信队列（`Default`=全局，`Enabled`=启用，`Disabled`=禁用） |
 | MaxRetries | -1 | 即时重试次数（-1=全局） |
 | MaxDelayRetries | -1 | 延迟重试次数（-1=全局） |
 | RetryDelaySeconds | -1 | 延迟重试间隔（-1=全局） |
@@ -377,7 +394,7 @@ catch (Exception ex)
 
 **Q：重试后消息消失了，没有进入死信队列？**
 
-- 检查全局配置或 Handler 的 `EnableDeadLetter` 是否为 `true`/`1`
+- 检查全局配置或 Handler 的 `EnableDeadLetter` 是否为 `true`/`TriState.Enabled`
 - 死信队列名为 `{queue}.dead`，可在 RabbitMQ 管理界面中确认该队列已创建
 
 **Q：优先级队列不按优先级消费？**
@@ -394,3 +411,138 @@ catch (Exception ex)
 
 - 业务对消息零丢失有强要求时启用（如支付、订单）
 - 对吞吐量敏感的场景（如日志、监控）应保持默认关闭，可通过业务幂等 + 本地消息表替代
+
+## 批量发布
+
+高吞吐场景下，逐条 `PublishAsync` 性能较低。`PublishBatchAsync` 复用同一个 Channel 连续发布多条消息，减少网络往返开销：
+
+```csharp
+var events = new List<OrderCreatedEvent>
+{
+    new() { OrderId = "001", Amount = 100m },
+    new() { OrderId = "002", Amount = 200m },
+    new() { OrderId = "003", Amount = 300m }
+};
+
+await publisher.PublishBatchAsync("order.exchange", "order.created", events);
+
+// 也支持共用 headers 和 priority
+await publisher.PublishBatchAsync("order.exchange", "order.vip", events,
+    headers: new Dictionary<string, object?> { ["source"] = "batch" },
+    priority: 5);
+```
+
+> **注意**：`PublishBatchAsync` 不支持延迟投递（`delay`），如需延迟请逐条使用 `PublishAsync`。
+
+## 连接自动重连
+
+当 RabbitMQ 服务重启或网络中断时，SDK 会自动尝试重连，采用指数退避策略：
+
+```
+连接失败 → 等待 1s → 重试 → 等待 2s → 重试 → 等待 4s → ... → 最长等待 30s
+```
+
+**配置示例：**
+
+```csharp
+builder.Services.AddRabbitMQ(options =>
+{
+    options.HostName = "rabbitmq-server";
+    options.UserName = "admin";
+    options.Password = "password";
+
+    // 连接恢复配置
+    options.AutomaticRecoveryEnabled = true;     // 启用 RabbitMQ.Client 内置自动恢复（默认 true）
+    options.NetworkRecoveryInterval = TimeSpan.FromSeconds(5); // 内置恢复间隔（默认 5s）
+
+    // SDK 层重连配置（当 GetConnectionAsync 发现连接断开时触发）
+    options.ReconnectMaxRetries = 10;            // 最大重试 10 次（0=不限次数）
+    options.ReconnectInitialDelay = TimeSpan.FromSeconds(1);  // 首次重试等待 1s
+    options.ReconnectMaxDelay = TimeSpan.FromSeconds(30);     // 单次最长等待 30s
+});
+```
+
+重连过程中的日志输出：
+
+```
+WARN  RabbitMQ 连接失败（第 1 次），将在 1s 后重试
+WARN  RabbitMQ 连接失败（第 2 次），将在 2s 后重试
+INFO  RabbitMQ 连接已恢复（第 3 次重试）
+```
+
+> 若超过 `ReconnectMaxRetries` 次仍无法连接，将抛出异常并记录 `CRITICAL` 级别日志。
+
+## 消费者 Channel 自动恢复
+
+消费者启动后，SDK 在后台每 10 秒检测一次所有消费者 Channel 的状态。当检测到 Channel 已关闭（如 RabbitMQ 重启、网络断开）时，会自动重新获取连接、创建新 Channel 并重新注册消费者：
+
+```
+Channel 断开 → 清理旧 Channel → 获取连接（触发重连） → 创建新 Channel → 重新声明队列/绑定 → 恢复消费
+```
+
+恢复过程中的日志输出：
+
+```
+WARN  消费者 OrderHandler 的 Channel 已断开，正在尝试恢复...
+INFO  消费者 OrderHandler 的 Channel 已恢复
+```
+
+> 无需任何额外配置，此功能默认启用。
+
+## 健康检查
+
+SDK 提供 `IHealthCheck` 实现，可集成到 ASP.NET Core 的健康检查端点，用于 K8s / Docker 存活探针检测：
+
+```csharp
+// 注册健康检查
+builder.Services.AddRabbitMQ(options => { /* ... */ });
+builder.Services.AddRabbitMQHealthCheck(); // 默认名称 "rabbitmq"
+
+// 也可自定义名称和标签
+builder.Services.AddRabbitMQHealthCheck("mq", "ready", "infrastructure");
+
+// 映射健康检查端点
+app.MapHealthChecks("/health");
+```
+
+**响应示例：**
+
+```json
+{
+  "status": "Healthy",
+  "entries": {
+    "rabbitmq": {
+      "status": "Healthy",
+      "description": "RabbitMQ 连接正常"
+    }
+  }
+}
+```
+
+## 配置验证
+
+SDK 在 `AddRabbitMQ()` 注册时会立即校验必填配置项（Fail-Fast），而不是等到第一次连接时才报错：
+
+```csharp
+// ❌ 缺少必填项，注册时立即抛出 ValidationException
+builder.Services.AddRabbitMQ(options =>
+{
+    options.HostName = "";  // 不能为空
+});
+// 抛出: ValidationException: "RabbitMQ HostName 不能为空"
+
+// ❌ Port 超出范围
+builder.Services.AddRabbitMQ(options =>
+{
+    options.Port = 99999;  // 超出 1-65535 范围
+});
+// 抛出: ValidationException: "RabbitMQ Port 必须在 1-65535 范围内"
+```
+
+| 属性 | 验证规则 |
+|------|----------|
+| HostName | 必填（`[Required]`） |
+| Port | 范围 1-65535（`[Range]`） |
+| UserName | 必填（`[Required]`） |
+| Password | 必填（`[Required]`） |
+| VirtualHost | 必填（`[Required]`） |

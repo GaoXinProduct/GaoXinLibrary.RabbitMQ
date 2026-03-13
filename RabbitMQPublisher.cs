@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text.Json;
 using Microsoft.Extensions.Options;
 using RabbitMQ.Client;
@@ -13,7 +14,7 @@ internal sealed class RabbitMQPublisher : IRabbitMQPublisher, IAsyncDisposable
     private readonly RabbitMQOptions _options;
     private IChannel? _channel;
     private readonly SemaphoreSlim _lock = new(1, 1);
-    private readonly HashSet<string> _declaredDelayInfra = [];
+    private readonly ConcurrentDictionary<string, bool> _declaredDelayInfra = new();
 
     public RabbitMQPublisher(RabbitMQConnectionManager connectionManager, IOptions<RabbitMQOptions> options)
     {
@@ -62,10 +63,41 @@ internal sealed class RabbitMQPublisher : IRabbitMQPublisher, IAsyncDisposable
         }
     }
 
+    public async Task PublishBatchAsync<T>(
+        string exchange,
+        string routingKey,
+        IEnumerable<T> messages,
+        IDictionary<string, object?>? headers = null,
+        byte? priority = null,
+        CancellationToken cancellationToken = default) where T : class
+    {
+        var channel = await GetChannelAsync(cancellationToken);
+
+        foreach (var message in messages)
+        {
+            var body = JsonSerializer.SerializeToUtf8Bytes(message);
+            var props = new BasicProperties
+            {
+                ContentType = "application/json",
+                DeliveryMode = DeliveryModes.Persistent,
+                MessageId = Guid.NewGuid().ToString("N"),
+                Timestamp = new AmqpTimestamp(DateTimeOffset.UtcNow.ToUnixTimeSeconds())
+            };
+
+            if (priority.HasValue)
+                props.Priority = priority.Value;
+
+            if (headers is not null)
+                props.Headers = new Dictionary<string, object?>(headers);
+
+            await channel.BasicPublishAsync(exchange, routingKey, false, props, body, cancellationToken);
+        }
+    }
+
     private async Task EnsureDelayInfraAsync(IChannel channel, string exchange, string routingKey, CancellationToken ct)
     {
         var key = $"{exchange}|{routingKey}";
-        if (!_declaredDelayInfra.Add(key)) return;
+        if (!_declaredDelayInfra.TryAdd(key, true)) return;
 
         var delayExchange = $"{exchange}.delay";
         var delayQueue = $"{exchange}.{routingKey}.delay";

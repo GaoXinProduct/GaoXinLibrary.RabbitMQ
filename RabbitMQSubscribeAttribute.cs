@@ -45,8 +45,8 @@ public sealed class RabbitMQSubscribeAttribute : Attribute
     /// <summary>队列最大长度（0 表示不限制）</summary>
     public int MaxLength { get; set; }
 
-    /// <summary>是否启用死信队列（-1 使用全局配置，0 禁用，1 启用）</summary>
-    public int EnableDeadLetter { get; set; } = -1;
+    /// <summary>是否启用死信队列（Default 使用全局配置，Enabled 启用，Disabled 禁用）</summary>
+    public TriState EnableDeadLetter { get; set; } = TriState.Default;
 
     /// <summary>消费者预取数（-1 使用全局配置，优先级队列建议设为 1）</summary>
     public int PrefetchCount { get; set; } = -1;

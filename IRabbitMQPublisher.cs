@@ -25,4 +25,21 @@ public interface IRabbitMQPublisher
         byte? priority = null,
         string? messageId = null,
         CancellationToken cancellationToken = default) where T : class;
+
+    /// <summary>
+    /// 批量发布消息到指定交换机，性能优于逐条发布
+    /// </summary>
+    /// <param name="exchange">交换机名称</param>
+    /// <param name="routingKey">路由键</param>
+    /// <param name="messages">消息集合</param>
+    /// <param name="headers">自定义消息头（所有消息共用）</param>
+    /// <param name="priority">消息优先级（所有消息共用）</param>
+    /// <param name="cancellationToken">取消令牌</param>
+    Task PublishBatchAsync<T>(
+        string exchange,
+        string routingKey,
+        IEnumerable<T> messages,
+        IDictionary<string, object?>? headers = null,
+        byte? priority = null,
+        CancellationToken cancellationToken = default) where T : class;
 }

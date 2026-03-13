@@ -25,6 +25,7 @@ internal sealed class RabbitMQConsumerHostedService : BackgroundService
     private readonly ILogger<RabbitMQConsumerHostedService> _logger;
     private readonly List<IChannel> _channels = [];
     private readonly List<(IChannel Channel, string ConsumerTag)> _consumers = [];
+    private readonly List<(MessageHandlerDescriptor Descriptor, RabbitMQSubscribeAttribute Attr)> _registeredConsumers = [];
     private readonly CancellationTokenSource _shutdownCts = new();
     private int _inflightCount;
 
@@ -61,10 +62,58 @@ internal sealed class RabbitMQConsumerHostedService : BackgroundService
             try
             {
                 await StartConsumerAsync(connection, descriptor, attr, stoppingToken);
+                _registeredConsumers.Add((descriptor, attr));
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "启动消费者 {Handler} 失败。", descriptor.HandlerType.Name);
+            }
+        }
+
+        // ── Channel 健康监控：检测断开并自动恢复 ─────────────────────────
+        await MonitorChannelsAsync(stoppingToken);
+    }
+
+    private async Task MonitorChannelsAsync(CancellationToken stoppingToken)
+    {
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            try
+            {
+                await Task.Delay(TimeSpan.FromSeconds(10), stoppingToken);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+
+            for (var i = _consumers.Count - 1; i >= 0; i--)
+            {
+                var (channel, _) = _consumers[i];
+                if (channel.IsOpen) continue;
+
+                if (i >= _registeredConsumers.Count) continue;
+                var (descriptor, attr) = _registeredConsumers[i];
+                var handlerName = descriptor.HandlerType.Name;
+
+                _logger.LogWarning("消费者 {Handler} 的 Channel 已断开，正在尝试恢复...", handlerName);
+
+                try
+                {
+                    // 清理旧记录
+                    var oldChannel = _consumers[i].Channel;
+                    _consumers.RemoveAt(i);
+                    _channels.Remove(oldChannel);
+                    try { oldChannel.Dispose(); } catch { /* ignore */ }
+
+                    var connection = await _connectionManager.GetConnectionAsync(stoppingToken);
+                    await StartConsumerAsync(connection, descriptor, attr, stoppingToken);
+                    _logger.LogInformation("消费者 {Handler} 的 Channel 已恢复", handlerName);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "消费者 {Handler} 的 Channel 恢复失败，将在下次检查时重试", handlerName);
+                }
             }
         }
     }
@@ -126,8 +175,8 @@ internal sealed class RabbitMQConsumerHostedService : BackgroundService
         // ── 解析重试参数 ─────────────────────────────────────────────────────
         var maxRetries = attr.MaxRetries >= 0 ? attr.MaxRetries : _options.MaxRetries;
         var maxDelayRetries = attr.MaxDelayRetries >= 0 ? attr.MaxDelayRetries : _options.MaxDelayRetries;
-        var retryDelayMs = (attr.RetryDelaySeconds >= 0 ? attr.RetryDelaySeconds : _options.RetryDelaySeconds) * 1000;
-        var enableDeadLetter = attr.EnableDeadLetter >= 0 ? attr.EnableDeadLetter == 1 : _options.EnableDeadLetter;
+        var retryDelayMs = (long)(attr.RetryDelaySeconds >= 0 ? attr.RetryDelaySeconds : _options.RetryDelaySeconds) * 1000;
+        var enableDeadLetter = attr.EnableDeadLetter == TriState.Default ? _options.EnableDeadLetter : attr.EnableDeadLetter == TriState.Enabled;
 
         // ── 声明死信队列 ──────────────────────────────────────────────────────
         var deadLetterQueue = $"{queueName}.dead";
@@ -166,7 +215,7 @@ internal sealed class RabbitMQConsumerHostedService : BackgroundService
     private async Task ProcessMessageAsync(
         IChannel channel, MessageHandlerDescriptor descriptor, MethodInfo handleMethod, string handlerName,
         string queueName, string retryWaitQueue, string deadLetterQueue,
-        int maxRetries, int maxDelayRetries, int retryDelayMs, bool enableDeadLetter,
+        int maxRetries, int maxDelayRetries, long retryDelayMs, bool enableDeadLetter,
         BasicDeliverEventArgs ea)
     {
         var retryCount = GetHeaderInt(ea.BasicProperties.Headers, HeaderRetryCount);
@@ -198,7 +247,16 @@ internal sealed class RabbitMQConsumerHostedService : BackgroundService
                     handlerName, retryCount + 1, maxRetries, messageId);
 
                 var props = BuildRetryProperties(retryCount + 1, delayRetryCount, messageId);
-                await channel.BasicPublishAsync("", queueName, false, props, ea.Body, CancellationToken.None);
+                try
+                {
+                    await channel.BasicPublishAsync("", queueName, false, props, ea.Body, CancellationToken.None);
+                }
+                catch (Exception republishEx)
+                {
+                    _logger.LogCritical(republishEx,
+                        "[{Handler}] 即时重试 republish 失败，消息已丢失！MessageId={MessageId}，请检查 RabbitMQ 连接状态",
+                        handlerName, messageId);
+                }
             }
             else if (delayRetryCount < maxDelayRetries)
             {
@@ -208,7 +266,16 @@ internal sealed class RabbitMQConsumerHostedService : BackgroundService
 
                 var props = BuildRetryProperties(0, delayRetryCount + 1, messageId);
                 props.Expiration = retryDelayMs.ToString();
-                await channel.BasicPublishAsync("", retryWaitQueue, false, props, ea.Body, CancellationToken.None);
+                try
+                {
+                    await channel.BasicPublishAsync("", retryWaitQueue, false, props, ea.Body, CancellationToken.None);
+                }
+                catch (Exception republishEx)
+                {
+                    _logger.LogCritical(republishEx,
+                        "[{Handler}] 延迟重试 republish 失败，消息已丢失！MessageId={MessageId}，请检查 RabbitMQ 连接状态",
+                        handlerName, messageId);
+                }
             }
             else if (enableDeadLetter)
             {
@@ -230,7 +297,16 @@ internal sealed class RabbitMQConsumerHostedService : BackgroundService
                         ["x-dead-time"] = DateTimeOffset.UtcNow.ToString("O")
                     }
                 };
-                await channel.BasicPublishAsync("", deadLetterQueue, false, deadProps, ea.Body, CancellationToken.None);
+                try
+                {
+                    await channel.BasicPublishAsync("", deadLetterQueue, false, deadProps, ea.Body, CancellationToken.None);
+                }
+                catch (Exception republishEx)
+                {
+                    _logger.LogCritical(republishEx,
+                        "[{Handler}] 死信队列投递失败，消息已丢失！MessageId={MessageId}，请检查 RabbitMQ 连接状态",
+                        handlerName, messageId);
+                }
             }
             else
             {
