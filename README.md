@@ -182,13 +182,13 @@ await publisher.PublishAsync("header.exchange", "",
 消息处理失败时自动进入重试流程：
 
 ```
-消费失败 → 即时重试（MaxRetries 次） → 延迟重试（MaxDelayRetries 次，每次等待 RetryDelaySeconds 秒） → 死信队列 / 丢弃
+消费失败 → 即时重试（MaxRetries 次） → 延迟重试（MaxDelayRetries 次，支持固定延迟/指数退避+抖动） → 死信队列 / 丢弃
 ```
 
 **流程细节：**
 
-1. Handler 抛异常 → ACK 移除原消息 → 以 `x-retry-count + 1` republish 到原队列（即时重试）
-2. 即时重试耗尽 → ACK 移除 → 发布到 `{queue}.retry.wait` 队列（带 TTL）
+1. Handler 抛异常 → 先 republish 到目标队列（即时重试/延迟重试）→ **republish 成功后再 ACK 原消息**
+2. 即时重试耗尽 → 发布到 `{queue}.retry.wait` 队列（带 TTL）
 3. TTL 过期 → 消息死信回原队列（`x-retry-count` 重置，`x-delay-retry-count + 1`）
 4. 延迟重试也耗尽 → 投递到 `{queue}.dead` 死信队列（启用时）或 ACK 丢弃（禁用时）
 
@@ -199,7 +199,10 @@ builder.Services.AddRabbitMQ(options =>
 {
     options.MaxRetries = 3;              // 即时重试 3 次
     options.MaxDelayRetries = 3;         // 延迟重试 3 次
-    options.RetryDelaySeconds = 10;      // 每次延迟 10 秒
+    options.RetryDelaySeconds = 10;      // 基础延迟 10 秒
+    options.EnableExponentialRetryBackoff = true; // 可选：指数退避
+    options.MaxRetryDelaySeconds = 300;  // 延迟上限 300 秒
+    options.EnableRetryJitter = true;    // 可选：延迟抖动
     options.EnableDeadLetter = true;     // 启用死信队列（默认 true）
     options.EnablePublisherConfirms = false; // 发布者确认（默认 false）
 });
@@ -315,7 +318,7 @@ builder.Services.AddRabbitMQ(options =>
 });
 ```
 
-启用后，`PublishAsync` 内部会调用 `WaitForConfirmsOrDieAsync`，若 Broker 返回 `nack` 或超时则抛出异常，调用方可捕获后进行补偿（如写入本地重试表）：
+启用后，`PublishAsync` 会在 Broker 未确认或发布失败时抛出异常，调用方可捕获后进行补偿（如写入本地重试表）：
 
 ```csharp
 try
@@ -354,10 +357,14 @@ catch (Exception ex)
 | MaxRetries | 3 | 即时重试最大次数 |
 | MaxDelayRetries | 3 | 延迟重试最大次数 |
 | RetryDelaySeconds | 10 | 延迟重试间隔秒数 |
+| EnableExponentialRetryBackoff | false | 是否启用指数退避延迟重试 |
+| MaxRetryDelaySeconds | 300 | 延迟重试最大间隔秒数 |
+| EnableRetryJitter | true | 是否在延迟重试中加入随机抖动 |
 | EnableDeadLetter | true | 是否启用死信队列 |
 | EnablePublisherConfirms | false | 是否启用发布者确认模式 |
-| AutoMigrateQueues | true | 队列参数不匹配时是否自动删除并重建队列（生产环境建议关闭） |
+| AutoMigrateQueues | false | 队列参数不匹配时是否自动删除并重建队列（默认关闭，避免生产误删） |
 | ShutdownTimeoutSeconds | 30 | 优雅关闭超时秒数（等待正在处理的消息完成） |
+| HealthCheckTimeoutSeconds | 2 | 健康检查连接超时秒数 |
 | AutomaticRecoveryEnabled | true | 是否启用 RabbitMQ.Client 内置的自动恢复 |
 | NetworkRecoveryInterval | 5s | 自动恢复间隔 |
 | ReconnectMaxRetries | 10 | 连接断开后重连最大重试次数（0=不限次数） |
@@ -505,6 +512,8 @@ builder.Services.AddRabbitMQHealthCheck("mq", "ready", "infrastructure");
 app.MapHealthChecks("/health");
 ```
 
+健康检查会按 `HealthCheckTimeoutSeconds`（默认 2 秒）快速失败，避免连接重试退避拖慢探针。
+
 **响应示例：**
 
 ```json
@@ -518,6 +527,32 @@ app.MapHealthChecks("/health");
   }
 }
 ```
+
+## 幂等扩展点
+
+库内提供 `IMessageDeduplicator` 扩展点，默认实现是 `NoOpMessageDeduplicator`（不改变现有行为）。  
+如果需要 Redis/数据库去重，可直接覆盖注册：
+
+```csharp
+builder.Services.AddSingleton<IMessageDeduplicator, RedisMessageDeduplicator>();
+```
+
+消费者执行前会调用 `IsDuplicateAsync`，执行成功后调用 `MarkProcessedAsync`；重复消息会直接 ACK 并跳过处理。
+
+## 指标（Metrics）
+
+内置 `System.Diagnostics.Metrics` 指标（Meter：`GaoXinLibrary.RabbitMQ`）：
+
+- `rabbitmq.consumer.processed`
+- `rabbitmq.consumer.retry`
+- `rabbitmq.consumer.delay_retry`
+- `rabbitmq.consumer.dead_letter`
+- `rabbitmq.consumer.discarded`
+- `rabbitmq.consumer.duplicate`
+- `rabbitmq.consumer.handle.duration.ms`
+- `rabbitmq.consumer.inflight`
+
+可通过 OpenTelemetry 或 `MeterListener` 直接采集。
 
 ## 配置验证
 

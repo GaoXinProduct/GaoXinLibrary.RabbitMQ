@@ -13,7 +13,9 @@ internal sealed class RabbitMQPublisher : IRabbitMQPublisher, IAsyncDisposable
     private readonly RabbitMQConnectionManager _connectionManager;
     private readonly RabbitMQOptions _options;
     private IChannel? _channel;
-    private readonly SemaphoreSlim _lock = new(1, 1);
+    private readonly SemaphoreSlim _channelLock = new(1, 1);
+    private readonly SemaphoreSlim _publishLock = new(1, 1);
+    private readonly SemaphoreSlim _delayInfraLock = new(1, 1);
     private readonly ConcurrentDictionary<string, bool> _declaredDelayInfra = new();
 
     public RabbitMQPublisher(RabbitMQConnectionManager connectionManager, IOptions<RabbitMQOptions> options)
@@ -32,9 +34,7 @@ internal sealed class RabbitMQPublisher : IRabbitMQPublisher, IAsyncDisposable
         string? messageId = null,
         CancellationToken cancellationToken = default) where T : class
     {
-        var channel = await GetChannelAsync(cancellationToken);
         var body = JsonSerializer.SerializeToUtf8Bytes(message);
-
         var props = new BasicProperties
         {
             ContentType = "application/json",
@@ -49,17 +49,27 @@ internal sealed class RabbitMQPublisher : IRabbitMQPublisher, IAsyncDisposable
         if (headers is not null)
             props.Headers = new Dictionary<string, object?>(headers);
 
-        if (delay is { TotalMilliseconds: > 0 })
+        // RabbitMQ channel is not thread-safe. Serialize publish operations to avoid protocol errors.
+        await _publishLock.WaitAsync(cancellationToken);
+        try
         {
-            await EnsureDelayInfraAsync(channel, exchange, routingKey, cancellationToken);
-            props.Expiration = ((long)delay.Value.TotalMilliseconds).ToString();
-            await channel.BasicPublishAsync(
-                $"{exchange}.delay", $"{exchange}.{routingKey}.delay",
-                false, props, body, cancellationToken);
+            var channel = await GetChannelAsync(cancellationToken);
+            if (delay is { TotalMilliseconds: > 0 })
+            {
+                await EnsureDelayInfraAsync(channel, exchange, routingKey, cancellationToken);
+                props.Expiration = ((long)delay.Value.TotalMilliseconds).ToString();
+                await channel.BasicPublishAsync(
+                    $"{exchange}.delay", $"{exchange}.{routingKey}.delay",
+                    false, props, body, cancellationToken);
+            }
+            else
+            {
+                await channel.BasicPublishAsync(exchange, routingKey, false, props, body, cancellationToken);
+            }
         }
-        else
+        finally
         {
-            await channel.BasicPublishAsync(exchange, routingKey, false, props, body, cancellationToken);
+            _publishLock.Release();
         }
     }
 
@@ -71,53 +81,73 @@ internal sealed class RabbitMQPublisher : IRabbitMQPublisher, IAsyncDisposable
         byte? priority = null,
         CancellationToken cancellationToken = default) where T : class
     {
-        var channel = await GetChannelAsync(cancellationToken);
-
-        foreach (var message in messages)
+        await _publishLock.WaitAsync(cancellationToken);
+        try
         {
-            var body = JsonSerializer.SerializeToUtf8Bytes(message);
-            var props = new BasicProperties
+            var channel = await GetChannelAsync(cancellationToken);
+            foreach (var message in messages)
             {
-                ContentType = "application/json",
-                DeliveryMode = DeliveryModes.Persistent,
-                MessageId = Guid.NewGuid().ToString("N"),
-                Timestamp = new AmqpTimestamp(DateTimeOffset.UtcNow.ToUnixTimeSeconds())
-            };
+                var body = JsonSerializer.SerializeToUtf8Bytes(message);
+                var props = new BasicProperties
+                {
+                    ContentType = "application/json",
+                    DeliveryMode = DeliveryModes.Persistent,
+                    MessageId = Guid.NewGuid().ToString("N"),
+                    Timestamp = new AmqpTimestamp(DateTimeOffset.UtcNow.ToUnixTimeSeconds())
+                };
 
-            if (priority.HasValue)
-                props.Priority = priority.Value;
+                if (priority.HasValue)
+                    props.Priority = priority.Value;
 
-            if (headers is not null)
-                props.Headers = new Dictionary<string, object?>(headers);
+                if (headers is not null)
+                    props.Headers = new Dictionary<string, object?>(headers);
 
-            await channel.BasicPublishAsync(exchange, routingKey, false, props, body, cancellationToken);
+                await channel.BasicPublishAsync(exchange, routingKey, false, props, body, cancellationToken);
+            }
+        }
+        finally
+        {
+            _publishLock.Release();
         }
     }
 
     private async Task EnsureDelayInfraAsync(IChannel channel, string exchange, string routingKey, CancellationToken ct)
     {
         var key = $"{exchange}|{routingKey}";
-        if (!_declaredDelayInfra.TryAdd(key, true)) return;
+        if (_declaredDelayInfra.ContainsKey(key))
+            return;
 
-        var delayExchange = $"{exchange}.delay";
-        var delayQueue = $"{exchange}.{routingKey}.delay";
-
-        await channel.ExchangeDeclareAsync(delayExchange, ExchangeType.Direct, true, false, null, false, ct);
-
-        var args = new Dictionary<string, object?>
+        await _delayInfraLock.WaitAsync(ct);
+        try
         {
-            ["x-dead-letter-exchange"] = exchange,
-            ["x-dead-letter-routing-key"] = routingKey
-        };
-        await channel.QueueDeclareAsync(delayQueue, true, false, false, args, false, ct);
-        await channel.QueueBindAsync(delayQueue, delayExchange, delayQueue, null, false, ct);
+            if (_declaredDelayInfra.ContainsKey(key))
+                return;
+
+            var delayExchange = $"{exchange}.delay";
+            var delayQueue = $"{exchange}.{routingKey}.delay";
+
+            await channel.ExchangeDeclareAsync(delayExchange, ExchangeType.Direct, true, false, null, false, ct);
+
+            var args = new Dictionary<string, object?>
+            {
+                ["x-dead-letter-exchange"] = exchange,
+                ["x-dead-letter-routing-key"] = routingKey
+            };
+            await channel.QueueDeclareAsync(delayQueue, true, false, false, args, false, ct);
+            await channel.QueueBindAsync(delayQueue, delayExchange, delayQueue, null, false, ct);
+            _declaredDelayInfra[key] = true;
+        }
+        finally
+        {
+            _delayInfraLock.Release();
+        }
     }
 
     private async Task<IChannel> GetChannelAsync(CancellationToken ct)
     {
         if (_channel is { IsOpen: true }) return _channel;
 
-        await _lock.WaitAsync(ct);
+        await _channelLock.WaitAsync(ct);
         try
         {
             if (_channel is { IsOpen: true }) return _channel;
@@ -130,7 +160,7 @@ internal sealed class RabbitMQPublisher : IRabbitMQPublisher, IAsyncDisposable
         }
         finally
         {
-            _lock.Release();
+            _channelLock.Release();
         }
     }
 
@@ -141,6 +171,8 @@ internal sealed class RabbitMQPublisher : IRabbitMQPublisher, IAsyncDisposable
             await _channel.CloseAsync();
             _channel.Dispose();
         }
-        _lock.Dispose();
+        _channelLock.Dispose();
+        _publishLock.Dispose();
+        _delayInfraLock.Dispose();
     }
 }

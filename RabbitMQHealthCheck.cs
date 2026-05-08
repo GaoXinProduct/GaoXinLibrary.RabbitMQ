@@ -1,4 +1,5 @@
 using Microsoft.Extensions.Diagnostics.HealthChecks;
+using Microsoft.Extensions.Options;
 
 namespace GaoXinLibrary.RabbitMQ;
 
@@ -8,10 +9,12 @@ namespace GaoXinLibrary.RabbitMQ;
 internal sealed class RabbitMQHealthCheck : IHealthCheck
 {
     private readonly RabbitMQConnectionManager _connectionManager;
+    private readonly RabbitMQOptions _options;
 
-    public RabbitMQHealthCheck(RabbitMQConnectionManager connectionManager)
+    public RabbitMQHealthCheck(RabbitMQConnectionManager connectionManager, IOptions<RabbitMQOptions> options)
     {
         _connectionManager = connectionManager;
+        _options = options.Value;
     }
 
     public async Task<HealthCheckResult> CheckHealthAsync(
@@ -19,13 +22,19 @@ internal sealed class RabbitMQHealthCheck : IHealthCheck
     {
         try
         {
-            var connection = await _connectionManager.GetConnectionAsync(cancellationToken);
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeoutCts.CancelAfter(TimeSpan.FromSeconds(_options.HealthCheckTimeoutSeconds));
+            var connection = await _connectionManager.GetConnectionAsync(timeoutCts.Token);
             if (connection.IsOpen)
             {
                 return HealthCheckResult.Healthy("RabbitMQ 连接正常");
             }
 
             return HealthCheckResult.Unhealthy("RabbitMQ 连接已断开");
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            return HealthCheckResult.Unhealthy($"RabbitMQ 健康检查超时（>{_options.HealthCheckTimeoutSeconds}s）");
         }
         catch (Exception ex)
         {

@@ -1,6 +1,7 @@
 using System.ComponentModel.DataAnnotations;
 using System.Reflection;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 
 namespace GaoXinLibrary.RabbitMQ;
 
@@ -20,6 +21,7 @@ public static class ServiceCollectionExtensions
 
         services.Configure(configure);
         services.AddSingleton<RabbitMQConnectionManager>();
+        services.TryAddSingleton<IMessageDeduplicator, NoOpMessageDeduplicator>();
         services.AddSingleton<IRabbitMQPublisher, RabbitMQPublisher>();
         services.AddHostedService<RabbitMQConsumerHostedService>();
         return services;
