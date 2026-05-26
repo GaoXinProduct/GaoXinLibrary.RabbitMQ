@@ -61,7 +61,7 @@ internal sealed class RabbitMQConnectionManager : IAsyncDisposable
             {
                 var conn = await factory.CreateConnectionAsync(ct);
                 if (attempt > 0)
-                    _logger.LogInformation("RabbitMQ 连接已恢复（第 {Attempt} 次重试）", attempt);
+                    _logger.LogInformation("RabbitMQ connection restored after {Attempt} attempts", attempt);
                 return conn;
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
@@ -69,11 +69,11 @@ internal sealed class RabbitMQConnectionManager : IAsyncDisposable
                 attempt++;
                 if (maxRetries > 0 && attempt >= maxRetries)
                 {
-                    _logger.LogCritical(ex, "RabbitMQ 连接失败，已达最大重试次数 {Max}，放弃连接", maxRetries);
+                    _logger.LogCritical(ex, "RabbitMQ connection failed, max retry limit {Max} reached, giving up", maxRetries);
                     throw;
                 }
 
-                _logger.LogWarning(ex, "RabbitMQ 连接失败（第 {Attempt} 次），将在 {Delay}s 后重试",
+                _logger.LogWarning(ex, "RabbitMQ connection failed (attempt {Attempt}), retrying in {Delay}s",
                     attempt, delay.TotalSeconds);
 
                 await Task.Delay(delay, ct);

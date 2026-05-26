@@ -1,5 +1,6 @@
 using System.ComponentModel.DataAnnotations;
 using System.Reflection;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 
@@ -20,6 +21,25 @@ public static class ServiceCollectionExtensions
         Validator.ValidateObject(options, new ValidationContext(options), validateAllProperties: true);
 
         services.Configure(configure);
+        services.AddSingleton<RabbitMQConnectionManager>();
+        services.TryAddSingleton<IMessageDeduplicator, NoOpMessageDeduplicator>();
+        services.AddSingleton<IRabbitMQPublisher, RabbitMQPublisher>();
+        services.AddHostedService<RabbitMQConsumerHostedService>();
+        return services;
+    }
+
+    /// <summary>
+    /// 从 <see cref="IConfiguration"/> 绑定 <see cref="RabbitMQOptions"/> 并注册 RabbitMQ 服务。
+    /// </summary>
+    /// <param name="services">服务集合</param>
+    /// <param name="configuration">应用程序配置，默认从 <c>"RabbitMQ"</c> 节读取</param>
+    /// <param name="sectionKey">配置节名称，默认 <c>"RabbitMQ"</c></param>
+    public static IServiceCollection AddRabbitMQ(this IServiceCollection services, IConfiguration configuration, string sectionKey = "RabbitMQ")
+    {
+        var options = new RabbitMQOptions();
+        configuration.GetSection(sectionKey).Bind(options);
+        Validator.ValidateObject(options, new ValidationContext(options), validateAllProperties: true);
+        services.Configure<RabbitMQOptions>(opt => configuration.GetSection(sectionKey).Bind(opt));
         services.AddSingleton<RabbitMQConnectionManager>();
         services.TryAddSingleton<IMessageDeduplicator, NoOpMessageDeduplicator>();
         services.AddSingleton<IRabbitMQPublisher, RabbitMQPublisher>();

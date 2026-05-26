@@ -34,6 +34,7 @@ public interface IRabbitMQPublisher
     /// <param name="messages">消息集合</param>
     /// <param name="headers">自定义消息头（所有消息共用）</param>
     /// <param name="priority">消息优先级（所有消息共用）</param>
+    /// <param name="messageId">消息唯一标识，用于全链路追踪。当提供时所有消息共用；为空则逐条自动生成 GUID</param>
     /// <param name="cancellationToken">取消令牌</param>
     Task PublishBatchAsync<T>(
         string exchange,
@@ -41,5 +42,6 @@ public interface IRabbitMQPublisher
         IEnumerable<T> messages,
         IDictionary<string, object?>? headers = null,
         byte? priority = null,
+        string? messageId = null,
         CancellationToken cancellationToken = default) where T : class;
 }

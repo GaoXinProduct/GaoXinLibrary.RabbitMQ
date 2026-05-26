@@ -68,7 +68,7 @@ internal sealed class RabbitMQConsumerHostedService : BackgroundService
     {
         var connection = await _connectionManager.GetConnectionAsync(stoppingToken);
         var descriptorList = _descriptors.ToList();
-        _logger.LogInformation("RabbitMQ 消费者服务已启动，共发现 {Count} 个处理器：{Handlers}",
+        _logger.LogInformation("RabbitMQ consumer service started, {Count} handler(s) found: {Handlers}",
             descriptorList.Count, string.Join(", ", descriptorList.Select(d => d.HandlerType.Name)));
 
         foreach (var descriptor in descriptorList)
@@ -76,7 +76,7 @@ internal sealed class RabbitMQConsumerHostedService : BackgroundService
             var attr = descriptor.HandlerType.GetCustomAttribute<RabbitMQSubscribeAttribute>();
             if (attr is null)
             {
-                _logger.LogWarning("Handler {Handler} 缺少 [Subscribe] 特性，已跳过。", descriptor.HandlerType.Name);
+                _logger.LogWarning("Handler {Handler} is missing [Subscribe] attribute, skipped.", descriptor.HandlerType.Name);
                 continue;
             }
 
@@ -86,7 +86,7 @@ internal sealed class RabbitMQConsumerHostedService : BackgroundService
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "启动消费者 {Handler} 失败。", descriptor.HandlerType.Name);
+                _logger.LogError(ex, "Failed to start consumer {Handler}.", descriptor.HandlerType.Name);
             }
         }
 
@@ -120,7 +120,7 @@ internal sealed class RabbitMQConsumerHostedService : BackgroundService
 
                 var handlerName = registration.Descriptor.HandlerType.Name;
 
-                _logger.LogWarning("消费者 {Handler} 的 Channel 已断开，正在尝试恢复...", handlerName);
+                _logger.LogWarning("Consumer {Handler} channel disconnected, attempting recovery...", handlerName);
 
                 try
                 {
@@ -132,11 +132,11 @@ internal sealed class RabbitMQConsumerHostedService : BackgroundService
 
                     var connection = await _connectionManager.GetConnectionAsync(stoppingToken);
                     await StartConsumerAsync(connection, registration.Descriptor, registration.Attr, stoppingToken);
-                    _logger.LogInformation("消费者 {Handler} 的 Channel 已恢复", handlerName);
+                    _logger.LogInformation("Consumer {Handler} channel recovered", handlerName);
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "消费者 {Handler} 的 Channel 恢复失败，将在下次检查时重试", handlerName);
+                    _logger.LogError(ex, "Consumer {Handler} channel recovery failed, will retry on next check", handlerName);
                 }
             }
         }
@@ -234,7 +234,7 @@ internal sealed class RabbitMQConsumerHostedService : BackgroundService
         }
 
         _logger.LogInformation(
-            "消费者已启动：{Handler} -> {Exchange}/{RoutingKey}（重试: {MaxRetries}次, 延迟重试: {MaxDelayRetries}次/{DelaySeconds}s）",
+            "Consumer started: {Handler} -> {Exchange}/{RoutingKey} (retries: {MaxRetries}, delay retries: {MaxDelayRetries}/{DelaySeconds}s)",
             handlerName, attr.Exchange, attr.RoutingKey, maxRetries, maxDelayRetries, retryDelayMs / 1000);
     }
 
@@ -264,7 +264,7 @@ internal sealed class RabbitMQConsumerHostedService : BackgroundService
             {
                 await HandleUnrecoverableMessageAsync(
                     channel, handlerName, queueName, deadLetterQueue,
-                    enableDeadLetter, messageId, ea, ex, "消息反序列化失败");
+                    enableDeadLetter, messageId, ea, ex, "Message deserialization failed");
                 return;
             }
 
@@ -273,7 +273,7 @@ internal sealed class RabbitMQConsumerHostedService : BackgroundService
             {
                 await channel.BasicAckAsync(ea.DeliveryTag, false);
                 DuplicateCounter.Add(1, new KeyValuePair<string, object?>("handler", handlerName));
-                _logger.LogInformation("[{Handler}] 检测到重复消息，已跳过处理。MessageId={MessageId}", handlerName, messageId);
+                _logger.LogInformation("[{Handler}] Duplicate message detected, skipped. MessageId={MessageId}", handlerName, messageId);
                 return;
             }
 
@@ -288,7 +288,7 @@ internal sealed class RabbitMQConsumerHostedService : BackgroundService
             HandleDurationMs.Record(
                 Stopwatch.GetElapsedTime(startTimestamp).TotalMilliseconds,
                 new KeyValuePair<string, object?>("handler", handlerName));
-            _logger.LogDebug("[{Handler}] 消息处理成功，MessageId={MessageId}", handlerName, messageId);
+            _logger.LogDebug("[{Handler}] Message processed successfully, MessageId={MessageId}", handlerName, messageId);
         }
         catch (Exception rawEx) when (rawEx is not OperationCanceledException)
         {
@@ -298,13 +298,13 @@ internal sealed class RabbitMQConsumerHostedService : BackgroundService
             if (retryCount < maxRetries)
             {
                 // ── 即时重试：原地 republish ──────────────────────────────
-                _logger.LogWarning(ex, "[{Handler}] 处理失败，即时重试 {Current}/{Max}，MessageId={MessageId}",
+                _logger.LogWarning(ex, "[{Handler}] Processing failed, immediate retry {Current}/{Max}, MessageId={MessageId}",
                     handlerName, retryCount + 1, maxRetries, messageId);
 
                 var props = BuildRetryProperties(retryCount + 1, delayRetryCount, messageId);
                 if (await TryRepublishAndAckOriginalAsync(
                     channel, queueName, props, ea, handlerName, messageId,
-                    "即时重试"))
+                    "Immediate retry"))
                 {
                     RetryCounter.Add(1, new KeyValuePair<string, object?>("handler", handlerName));
                 }
@@ -315,14 +315,14 @@ internal sealed class RabbitMQConsumerHostedService : BackgroundService
                 var delayMs = CalculateDelayRetryDelayMs(retryDelayMs, nextDelayRetry);
 
                 // ── 延迟重试：投递到 retry.wait 队列 ─────────────────────
-                _logger.LogWarning(ex, "[{Handler}] 即时重试耗尽，延迟重试 {Current}/{Max}，等待 {Delay}s，MessageId={MessageId}",
+                _logger.LogWarning(ex, "[{Handler}] Immediate retries exhausted, delayed retry {Current}/{Max}, waiting {Delay}s, MessageId={MessageId}",
                     handlerName, nextDelayRetry, maxDelayRetries, delayMs / 1000, messageId);
 
                 var props = BuildRetryProperties(0, nextDelayRetry, messageId);
                 props.Expiration = delayMs.ToString();
                 if (await TryRepublishAndAckOriginalAsync(
                     channel, retryWaitQueue, props, ea, handlerName, messageId,
-                    "延迟重试"))
+                    "Delayed retry"))
                 {
                     DelayRetryCounter.Add(1, new KeyValuePair<string, object?>("handler", handlerName));
                 }
@@ -331,7 +331,7 @@ internal sealed class RabbitMQConsumerHostedService : BackgroundService
             {
                 // ── 投递到死信队列 ─────────────────────────────────────────
                 _logger.LogError(ex,
-                    "[{Handler}] 所有重试已耗尽（即时:{MaxRetries}，延迟:{MaxDelayRetries}），消息已投递到死信队列，MessageId={MessageId}",
+                    "[{Handler}] All retries exhausted (immediate:{MaxRetries}, delayed:{MaxDelayRetries}), message moved to dead letter queue, MessageId={MessageId}",
                     handlerName, maxRetries, maxDelayRetries, messageId);
 
                 var deadProps = new BasicProperties
@@ -349,7 +349,7 @@ internal sealed class RabbitMQConsumerHostedService : BackgroundService
                 };
                 if (await TryRepublishAndAckOriginalAsync(
                     channel, deadLetterQueue, deadProps, ea, handlerName, messageId,
-                    "死信投递"))
+                    "Dead letter publish"))
                 {
                     DeadLetterCounter.Add(1, new KeyValuePair<string, object?>("handler", handlerName));
                 }
@@ -358,7 +358,7 @@ internal sealed class RabbitMQConsumerHostedService : BackgroundService
             {
                 // ── 死信队列未启用，直接丢弃 ───────────────────────────────
                 _logger.LogError(ex,
-                    "[{Handler}] 所有重试已耗尽（即时:{MaxRetries}，延迟:{MaxDelayRetries}），消息已丢弃，MessageId={MessageId}",
+                    "[{Handler}] All retries exhausted (immediate:{MaxRetries}, delayed:{MaxDelayRetries}), message discarded, MessageId={MessageId}",
                     handlerName, maxRetries, maxDelayRetries, messageId);
                 await channel.BasicAckAsync(ea.DeliveryTag, false);
                 DiscardCounter.Add(1, new KeyValuePair<string, object?>("handler", handlerName));
@@ -380,7 +380,7 @@ internal sealed class RabbitMQConsumerHostedService : BackgroundService
         if (!enableDeadLetter)
         {
             _logger.LogError(ex,
-                "[{Handler}] {Reason}，死信未启用，消息丢弃。Queue={Queue} MessageId={MessageId}",
+                "[{Handler}] {Reason}, dead letter not enabled, message discarded. Queue={Queue} MessageId={MessageId}",
                 handlerName, reason, queueName, messageId);
             await channel.BasicAckAsync(ea.DeliveryTag, false);
             DiscardCounter.Add(1, new KeyValuePair<string, object?>("handler", handlerName));
@@ -402,7 +402,7 @@ internal sealed class RabbitMQConsumerHostedService : BackgroundService
         };
 
         if (await TryRepublishAndAckOriginalAsync(
-                channel, deadLetterQueue, deadProps, ea, handlerName, messageId, "不可重试消息死信投递"))
+                channel, deadLetterQueue, deadProps, ea, handlerName, messageId, "Unrecoverable message dead letter publish"))
         {
             DeadLetterCounter.Add(1, new KeyValuePair<string, object?>("handler", handlerName));
         }
@@ -426,7 +426,7 @@ internal sealed class RabbitMQConsumerHostedService : BackgroundService
         catch (Exception republishEx)
         {
             _logger.LogCritical(republishEx,
-                "[{Handler}] {Purpose}失败，原消息保持未确认状态等待重投。MessageId={MessageId}",
+                "[{Handler}] {Purpose} failed, original message remains unacknowledged pending re-delivery. MessageId={MessageId}",
                 handlerName, purpose, messageId);
             return false;
         }
@@ -506,13 +506,13 @@ internal sealed class RabbitMQConsumerHostedService : BackgroundService
             if (!_options.AutoMigrateQueues)
             {
                 _logger.LogError(
-                    "队列 {Queue} 参数不匹配且 AutoMigrateQueues=false，请手动在 RabbitMQ 管理面板删除该队列后重启。原因：{Reason}",
+                    "Queue {Queue} parameter mismatch and AutoMigrateQueues=false, manually delete queue in RabbitMQ management UI and restart. Reason: {Reason}",
                     queueName, ex.ShutdownReason.ReplyText);
                 throw;
             }
 
             _logger.LogWarning(
-                "队列 {Queue} 参数不匹配（PRECONDITION_FAILED），正在自动删除并重建。原因：{Reason}",
+                "Queue {Queue} parameter mismatch (PRECONDITION_FAILED), auto-deleting and recreating. Reason: {Reason}",
                 queueName, ex.ShutdownReason.ReplyText);
 
             // 原 channel 已被 broker 关闭，需要新建
@@ -521,14 +521,14 @@ internal sealed class RabbitMQConsumerHostedService : BackgroundService
             await channel.QueueDeleteAsync(queueName, false, false, ct);
             await channel.QueueDeclareAsync(queueName, durable, false, autoDelete, arguments, false, ct);
 
-            _logger.LogInformation("队列 {Queue} 已重建完成", queueName);
+            _logger.LogInformation("Queue {Queue} recreated successfully", queueName);
             return channel;
         }
     }
 
     public override async Task StopAsync(CancellationToken cancellationToken)
     {
-        _logger.LogInformation("RabbitMQ 消费者服务正在关闭，停止接收新消息...");
+        _logger.LogInformation("RabbitMQ consumer service shutting down, stopping new message intake...");
 
         List<ConsumerRegistration> registrations;
         lock (_consumerStateLock)
@@ -554,7 +554,7 @@ internal sealed class RabbitMQConsumerHostedService : BackgroundService
 
         if (inflight > 0)
         {
-            _logger.LogInformation("等待 {Count} 条正在处理的消息完成（超时 {Timeout}s）...", inflight, _options.ShutdownTimeoutSeconds);
+            _logger.LogInformation("Waiting for {Count} in-flight message(s) to complete (timeout {Timeout}s)...", inflight, _options.ShutdownTimeoutSeconds);
 
             while (Volatile.Read(ref _inflightCount) > 0 && DateTime.UtcNow < deadline)
             {
@@ -563,9 +563,9 @@ internal sealed class RabbitMQConsumerHostedService : BackgroundService
 
             inflight = Volatile.Read(ref _inflightCount);
             if (inflight > 0)
-                _logger.LogWarning("关闭超时，仍有 {Count} 条消息未完成，将强制关闭。", inflight);
+                _logger.LogWarning("Shutdown timeout, {Count} message(s) still in-flight, forcing shutdown.", inflight);
             else
-                _logger.LogInformation("所有消息已处理完成。");
+                _logger.LogInformation("All in-flight messages completed.");
         }
 
         // ── 3. 通知 Handler 中的 CancellationToken ──────────────────────
@@ -582,7 +582,7 @@ internal sealed class RabbitMQConsumerHostedService : BackgroundService
             catch { /* ignore on shutdown */ }
         }
 
-        _logger.LogInformation("RabbitMQ 消费者服务已关闭。");
+        _logger.LogInformation("RabbitMQ consumer service stopped.");
         await base.StopAsync(cancellationToken);
     }
 

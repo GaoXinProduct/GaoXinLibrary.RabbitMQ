@@ -1,20 +1,26 @@
 using Microsoft.Extensions.Diagnostics.HealthChecks;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
 namespace GaoXinLibrary.RabbitMQ;
 
 /// <summary>
-/// RabbitMQ 健康检查，验证连接是否可用
+/// RabbitMQ health check that verifies connection availability
 /// </summary>
 internal sealed class RabbitMQHealthCheck : IHealthCheck
 {
     private readonly RabbitMQConnectionManager _connectionManager;
     private readonly RabbitMQOptions _options;
+    private readonly ILogger<RabbitMQHealthCheck> _logger;
 
-    public RabbitMQHealthCheck(RabbitMQConnectionManager connectionManager, IOptions<RabbitMQOptions> options)
+    public RabbitMQHealthCheck(
+        RabbitMQConnectionManager connectionManager,
+        IOptions<RabbitMQOptions> options,
+        ILogger<RabbitMQHealthCheck> logger)
     {
         _connectionManager = connectionManager;
         _options = options.Value;
+        _logger = logger;
     }
 
     public async Task<HealthCheckResult> CheckHealthAsync(
@@ -27,18 +33,22 @@ internal sealed class RabbitMQHealthCheck : IHealthCheck
             var connection = await _connectionManager.GetConnectionAsync(timeoutCts.Token);
             if (connection.IsOpen)
             {
-                return HealthCheckResult.Healthy("RabbitMQ 连接正常");
+                _logger.LogInformation("RabbitMQ health check passed, connection is open");
+                return HealthCheckResult.Healthy("RabbitMQ connection is healthy");
             }
 
-            return HealthCheckResult.Unhealthy("RabbitMQ 连接已断开");
+            _logger.LogWarning("RabbitMQ health check failed, connection is closed");
+            return HealthCheckResult.Unhealthy("RabbitMQ connection is closed");
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
-            return HealthCheckResult.Unhealthy($"RabbitMQ 健康检查超时（>{_options.HealthCheckTimeoutSeconds}s）");
+            _logger.LogWarning("RabbitMQ health check timed out after {TimeoutSeconds}s", _options.HealthCheckTimeoutSeconds);
+            return HealthCheckResult.Unhealthy($"RabbitMQ health check timed out (>{_options.HealthCheckTimeoutSeconds}s)");
         }
         catch (Exception ex)
         {
-            return HealthCheckResult.Unhealthy("RabbitMQ 连接失败", ex);
+            _logger.LogError(ex, "RabbitMQ health check failed with exception");
+            return HealthCheckResult.Unhealthy("RabbitMQ connection failed", ex);
         }
     }
 }
